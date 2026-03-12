@@ -1,0 +1,155 @@
+
+
+What’s the cost of getting data wrong vs spending a week building the curation pipeline?
+In the early days of my career, I was working on a Lead Scoring model which would score the viability of every signup on the website and assign a probability score of its conversion according to its activity on the App/Website. Here, I learned the hard earned lesson of data quality and calibration of classification models. The value of doing that painful, grunt-like EDA step so i could surface the signal or at least throw away the noise. 
+
+[TLDR] - pending
+The Olmo 3 technical report is one of the most well written reports in open source AI especially . This ~70 pager will take awhile but its definitely worth it. The report introduces the concept of “Model Flow“(open source full lifecycle of the model) which arguably no other lab has done justice to. It reads like a dense textbook with plenty of graphs and explanations about the nitty gritty details. For example, this is such an important detail for practitioners. I was about to make this mistake in my training runs and this insight mentioned multiple times in the report saved me. (Yes i am aware 6 likes is sad)
+
+
+
+
+
+The central question we try to answer is - 
+
+
+If compute is finite, how does better data curation buy you capability per token?
+
+
+
+To understand this deeply, i went into the three main pillars for decision making:
+
+
+
+
+
+What data should I use to pre-train the base model?
+
+
+
+What capability (benchmark performance) do I get for a chosen data mix?
+
+
+
+What is the cost of compute to train on this data?
+
+
+
+Note - a data mix is a combinatorial sampling of tokens from different text datasets. In case of Olmo, the larger data sources are Common Crawl, StackEdu, FineMath, Arxiv etc.  
+
+
+
+
+
+Common Crawl contributes 76.1% of all  tokens for pre-training. 
+
+Interesting part of the paper is the kinf of pipeline they use to filter and pre-process data at the Trillion tokens scale, as an NLP data scientist this is fascinating on a number of levels. Every source of data goes though a pipeline of multiple steps, some of which are common and heuristic while some like Deduplication and a novel Topic and Quality classification step. In yellow boxes below.
+
+
+
+
+
+To pre-train the model, Allen AI team must ensure that the data fed into model is very high quality and they get the most bang for their buck, they used two very interesting techniques which piqued my interest:
+
+Deduplication
+
+They used text hashes as the first step to simply remove the similar text documents which are completely the same. Then they used a fuzzy dedup method which use Min-Hash based technique as the second step, this basically removes the documents whose contents are the same but only differ in Headers and footers. They split the entire dataset into 32 shards, ran min-hash on each shard and then performed exhaustive pairwise Jaccard similarity checks within each identified cluster. then they move on to the final step of Substring Deduplication which involves using a novel fuzzy suffix-array based procedure to identify any substring in the documents which are 500 bytes or more that occurred multiple times. 
+
+
+
+
+
+
+
+Topic and Quality Classification
+
+The classification step is very interesting and helps me understand a new way to use open and public datasets in a novel way to build classifiers. They start by using the WebOrganizer tool to categorize the deduplicated corpus into 24 categories (e.g. “Science and Technology”, “Politics”). The final classifier is a 20 tier labels for the Quality classifier from following DCLM, here they Openhermes-2.5, ELI5, Ultrachat-200k and WildChat as positive examples and DCLM-RefinedWeb as the negative training examples.  
+
+
+
+
+
+This results in 480 disjoints subsets of (24 X 20). 24 topics from the first classifier and 20 quality tiers enabling fine grained control over the topic and quality distribution.
+
+
+So how did they get to 5.9T token data mix?
+
+So how did they get to 5.9T token data mix?
+
+These guys use a procedure called Constrained Data Mixing which is basically two components: The base procedure and a meta-procedure to update the existing mix when domains change.
+
+
+
+
+
+base procedure: they train a swarm of 30M parameter models on 3B tokens each, sampled from different data mixes—think of it as trying 200+ different recipes to see which works best. Each tiny model is tested on a Base Easy suite eval which is created specifically for testing base models.
+
+
+
+Each model provides a data point mapping mixture weights to task performance measured in BPB (bits-per-byte—lower is better). After training all these proxy models, they fit regression models per task that can predict: “if we use X% web data and Y% code, here’s the BPB we’ll get.”
+
+
+
+Finally, they look for the mixture that minimizes the average task BPB since they’ve decided previously that the token budget is going to be 6T.
+
+Imagine this to be an optimization problem—but here’s the catch: it’s a *constrained* optimization problem, and those constraints are what make this whole thing work. Without constraints, the optimizer might discover that math content gives the best performance and decide “great, make the dataset 80% math!” 
+
+Problem: they only have 200B math tokens total. To get 80% of 6T tokens (4.8T) from 200B would require repeating every math document 24 times. 
+
+So they impose hard limits: no data source can be repeated more than 4-7X and everything must sum to exactly 6T tokens. For example, math with 200B tokens can contribute at most 1.4T tokens (200B × 7), capping it at 23% of the dataset—even if pure math would theoretically give better scores.
+
+Science/Math/Tech = 35% → Need 2.1T tokens
+
+From 800B available:
+  Top 5% (40B)   × 7 = 280B
+  80-95% (120B)  × 6 = 720B
+  60-80% (160B)  × 4 = 640B
+  40-60% (160B)  × 2 = 320B
+  ───────────────────────
+  Total:             1.96T ✓
+
+Meta-procedure—conditional mixing—saves massive compute. OLMo 3’s trick: once you’ve optimized a mix, freeze it as a single “virtual domain” and only optimize over the new stuff.
+
+They did this in three rounds: Round 1 optimized 24 WebOrganizer categories in web data (swarm of ~120 models). Round 2 froze that mix, treated it as occupying 75% of the budget, and only optimized 15 programming languages within the remaining 25% (swarm of ~80 models). Round 3 froze everything and integrated 24 PDF topics (~125 models). 
+
+Quality-aware upsampling. Once data mixing says “35% should be Science/Math content,” they still need to decide *which* documents within Science/Math to include. Not all documents are equal—some are brilliant arXiv papers, others are mediocre blog posts.
+
+Instead of binary filtering, they use a smooth exponential curve. The bottom 40% gets discarded. The 40-60th percentile appears once. The 60-80th percentile gets repeated 2-4 times. The 80-95th percentile repeats 4-6 times. And the top 5%? That gold gets repeated a full 7 times. It’s like Spotify recommendations—you don’t want your favorite song on endless repeat, but you definitely want to hear it more than your #50 song.
+
+Think of it as a 2D optimization matrix: rows are topics (Science, Code, Math, PDFs) and columns are quality tiers (top 5%, next 15%, middle 20%, etc.). Data mixing determines what percentage comes from each row. Quality upsampling determines how many times documents from each column get repeated. These optimizations are completely orthogonal—they can be solved independently and then combined.
+
+Here’s a concrete example: Say data mixing determines Science/Math/Tech should be 35% of 6T = 2.1T tokens. They have 800B Science/Math tokens available. Quality upsampling creates a curve calibrated to deliver exactly 2.1T: top 5% (40B) × 7 = 280B, 80-95th percentile (120B) × 6 = 720B, 60-80th (160B) × 4 = 640B, 40-60th (160B) × 2 = 320B. Total: 1.96T ≈ 2.1T tokens. The curve parameters are numerically solved to satisfy three constraints: integral equals target tokens, maximum upsampling ≤ 7, and monotonically increasing.
+
+When they tested quality-aware upsampling against flat filtering strategies, it won across every single benchmark. On Math Easy, flat filtering scored 0.858-0.870 BPB while quality-aware scored 0.740 BPB—a huge improvement. The secret is maintaining diversity (keeping 60% of data) while intelligently varying repetition rates, versus flat filtering which discards 50-90% of data and just repeats survivors.
+
+The final result: every single token in the 6T training corpus earned its place through two-stage optimization. First, swarm optimization with constraints picked which topics to emphasize. Then, quality-aware upsampling with mathematical constraints picked which documents within those topics to prioritize. Compared to natural distribution sampling, their optimized mix improved performance by an average of 0.056 BPB, with peak improvements hitting 0.209 BPB on specific benchmarks. That’s the power of principled, data-driven optimization over guesswork.
+
+
+
+Olmo 3 Base
+
+Olmo3 Base is trained on the  Olmo-Core codebase which is mostly uses torch.compile and custom kernels for attention and batching. The codebase achieves a healthy 43% MFU using bfloat16. Throughput - 7700 tokens per second per GPU for Olmo 3 Base-7B and 1900 for Olmo 3 Base-32B. 
+
+ Generic overview of all the data going into training in each stage.
+
+Pre-Training
+
+Olmo introduces Dolma 3, a 5.9T token data mix. Although This data mix is pretty much similar to other open pre-training recipes it has one new additional source of data. They convert academic PDFs to linearized plain-text using OlmOCR.
+Compute USED - 1024 H100s == 128 nodes each with 8xH100(80GB) 
+
+Mid-Training
+
+The mid-training dataset is significantly smaller (only 100B tokens) but it is a clear steer towards benchmark specific performance specifically across  code, math and general knowledge QA domains. This also includes instruction following and thinking traces to lay groundwork for post-training.
+
+Compute USED - 128 H100s == 16 nodes each with 8xH100(80GB) 
+
+Long-Context Extension
+
+An extended “long context” sequence is part of the mid-training which uses scientific PDFs, these were part of every stage of training but is emphasized for long context here with over 4.5 million docs with len()>32k tokens, totaling to about 50 billion tokens.
+
+Compute USED - 256 H100s == 32 nodes each with 8xH100(80GB) 
+
+
+
+
+
